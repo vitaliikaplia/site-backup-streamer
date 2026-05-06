@@ -1,0 +1,26 @@
+{
+  "name": "kaplia/site-backup-streamer",
+  "description": "WordPress dashboard backup streamer plugin.",
+  "type": "wordpress-plugin",
+  "license": "proprietary",
+  "authors": [
+    {
+      "name": "Vitalii Kaplia",
+      "email": "vitalii.kaplia@gmail.com",
+      "homepage": "https://vitaliikaplia.com/"
+    }
+  ],
+  "require": {
+    "php": ">=8.1",
+    "ifsnop/mysqldump-php": "^2.12",
+    "maennchen/zipstream-php": "^3.1"
+  },
+  "config": {
+    "platform": {
+      "php": "8.1"
+    },
+    "allow-plugins": {
+      "composer/installers": true
+    }
+  }
+}

@@ -1,0 +1,41 @@
+<?php return array(
+    'root' => array(
+        'name' => 'kaplia/site-backup-streamer',
+        'pretty_version' => '1.0.0+no-version-set',
+        'version' => '1.0.0.0',
+        'reference' => null,
+        'type' => 'wordpress-plugin',
+        'install_path' => __DIR__ . '/../../',
+        'aliases' => array(),
+        'dev' => false,
+    ),
+    'versions' => array(
+        'ifsnop/mysqldump-php' => array(
+            'pretty_version' => 'v2.12',
+            'version' => '2.12.0.0',
+            'reference' => '2d3a43fc0c49f23bf7dee392b0dd1f8c799f89d3',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../ifsnop/mysqldump-php',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+        'kaplia/site-backup-streamer' => array(
+            'pretty_version' => '1.0.0+no-version-set',
+            'version' => '1.0.0.0',
+            'reference' => null,
+            'type' => 'wordpress-plugin',
+            'install_path' => __DIR__ . '/../../',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+        'maennchen/zipstream-php' => array(
+            'pretty_version' => '3.1.1',
+            'version' => '3.1.1.0',
+            'reference' => '6187e9cc4493da94b9b63eb2315821552015fca9',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../maennchen/zipstream-php',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+    ),
+);
