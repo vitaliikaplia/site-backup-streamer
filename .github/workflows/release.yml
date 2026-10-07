@@ -1,0 +1,117 @@
+name: Release
+
+# Push a tag vX.Y.Z (matching the plugin version everywhere) to publish a GitHub Release with
+# site-backup-streamer.zip + site-backup-streamer.zip.sha256. Sites on 1.1.0+ update only from these
+# release assets (1.0.0 has no updater and is updated to 1.1.0 once by hand).
+#
+# Three jobs keep the package trustworthy: `package` builds the zip and the release notes with git and
+# the runner's preinstalled PHP only (no third-party actions) and checks the unpacked zip (every
+# required file present, vendor loads both export libraries, every PHP file lints); `verify` is a pure
+# pass/fail gate (lint/tests/version check on the lowest and the highest supported PHP, via setup-php,
+# read-only token); only `publish` — first-party actions and the preinstalled gh CLI — gets
+# `contents: write`, and it uses nothing that `verify` produced.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        php: ['8.3', '8.5']
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, zlib, zip, pdo_mysql
+          coverage: none
+          tools: none
+
+      - name: Lint (php -l)
+        run: php bin/lint.php
+
+      - name: Tests
+        run: php tests/run.php
+
+      - name: Version matches the tag
+        run: php bin/check-version.php "$GITHUB_REF_NAME"
+
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build site-backup-streamer.zip (git archive honours export-ignore)
+        run: |
+          git archive --format=zip --prefix=site-backup-streamer/ -o site-backup-streamer.zip "$GITHUB_SHA"
+          sha256sum site-backup-streamer.zip > site-backup-streamer.zip.sha256
+          cat site-backup-streamer.zip.sha256
+          unzip -l site-backup-streamer.zip | tail -n 3
+          unzip -l site-backup-streamer.zip | grep ' site-backup-streamer/site-backup-streamer.php$' > /dev/null
+          unzip -l site-backup-streamer.zip | grep ' site-backup-streamer/vendor/autoload.php$' > /dev/null
+          if unzip -l site-backup-streamer.zip | grep -E ' site-backup-streamer/(tests|bin|\.github|\.idea)/| site-backup-streamer/\.git(attributes|ignore)$'; then
+            echo "export-ignore did not apply" >&2
+            exit 1
+          fi
+
+      - name: The unpacked zip loads (required files present, vendor complete, every PHP file lints)
+        run: |
+          php -v
+          rm -rf build && mkdir build && unzip -q site-backup-streamer.zip -d build
+          php bin/check-package.php build/site-backup-streamer
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          php bin/release-notes.php "$GITHUB_REF_NAME" > release-notes.md
+          php bin/release-notes.php --title "$GITHUB_REF_NAME" > release-title.txt
+          cat release-title.txt release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            site-backup-streamer.zip
+            site-backup-streamer.zip.sha256
+            release-notes.md
+            release-title.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [verify, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+
+      - name: Checksum still matches the built zip
+        run: sha256sum -c site-backup-streamer.zip.sha256
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" site-backup-streamer.zip site-backup-streamer.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$(cat release-title.txt)" \
+            --notes-file release-notes.md

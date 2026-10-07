@@ -1,0 +1,8 @@
+# Development-only files stay out of release zips (git archive) and GitHub source archives.
+# vendor/ is committed on purpose: the release zip must work without running composer on the site.
+/.github            export-ignore
+/tests              export-ignore
+/bin                export-ignore
+/.gitattributes     export-ignore
+/.gitignore         export-ignore
+/.idea              export-ignore
