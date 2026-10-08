@@ -71,6 +71,7 @@ function wp_convert_hr_to_bytes($value) {
     return min($bytes, PHP_INT_MAX);
 }
 function size_format($bytes, $decimals = 0) { return round($bytes / 1048576, $decimals) . ' MB'; }
+function wp_raise_memory_limit($context = 'admin') { return false; }
 
 // ── Load the units under test ────────────────────────────────────────────────
 

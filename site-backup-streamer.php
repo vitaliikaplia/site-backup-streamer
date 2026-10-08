@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Site Backup Streamer
  * Description: Adds a dashboard widget for streaming WordPress site files and database backups.
- * Version: 1.1.1
+ * Version: 1.1.2
  * Requires at least: 6.0
  * Requires PHP: 8.1
  * Tested up to: 7.0
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
-	define( 'SBS_VERSION', '1.1.1' );
+	define( 'SBS_VERSION', '1.1.2' );
 	define( 'SBS_FILE', __FILE__ );
 	define( 'SBS_BASENAME', plugin_basename( __FILE__ ) );
 	// Branch of the dev update channel (SBS_UPDATE_CHANNEL = 'branch'); can be overridden in wp-config.php.
@@ -35,9 +35,25 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 	final class SBS_Site_Backup_Streamer {
 		private const ACTION            = 'sbs_download_backup';
 		private const TYPES             = array( 'files', 'database' );
-		private const ZIP_MIN_TIMESTAMP = 315532800; // 1980-01-01 00:00:00 UTC.
-		// ZipStream reads every file in 16 MB blocks, and fread() allocates the whole block up front.
-		private const ZIP_MEMORY_HEADROOM = 33554432; // 32 MB.
+		private const ZIP_MIN_TIMESTAMP = 315532800;  // 1980-01-01 00:00:00 UTC.
+		private const ZIP_MAX_TIMESTAMP = 4354819198; // 2107-12-31 23:59:58 UTC, the last DOS date.
+		// ZipStream reads a file in 16 MB blocks, fread() allocates the whole block up front, and the previous
+		// block is still alive while the next one is read: a file needs up to two blocks of min(size, 16 MB).
+		private const ZIP_READ_BLOCK = 16777216;
+		// Hashing, headers, the central directory record of the file and 2 MB heap chunks.
+		private const ZIP_MEMORY_MARGIN = 4194304;
+		// ZipStream keeps the central directory records in one array. When it doubles, the new block is allocated
+		// while the old one is still alive: 32 bytes a slot on PHP 8.1, 16 since packed arrays hold bare zvals (8.2).
+		private const ZIP_CDR_SLOT = PHP_VERSION_ID >= 80200 ? 16 : 32;
+		// Kept free while files are added, so backup-incomplete.txt still fits once the memory has run out.
+		private const ZIP_NOTE_RESERVE = 4194304;
+		// Below this not even small files fit, so the archive does not start: every file needs the margin and the
+		// reserve, and the measured usage moves in 2 MB heap chunks.
+		private const ZIP_MEMORY_MINIMUM = 12582912;
+		// Lists the files left out for lack of memory; added to the archive root only when there are any.
+		private const ZIP_INCOMPLETE_NOTE = 'backup-incomplete.txt';
+		private const ZIP_NOTE_MAX_FILES  = 1000;
+		private const ZIP_NOTE_MAX_BYTES  = 262144; // Of listed file names.
 
 		/**
 		 * Boots plugin hooks.
@@ -302,7 +318,7 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 				}
 			}
 
-			if ( ! method_exists( 'ZipStream\\ZipStream', 'addFileFromPath' ) || ! method_exists( 'ZipStream\\ZipStream', 'finish' ) ) {
+			if ( ! method_exists( 'ZipStream\\ZipStream', 'addFileFromPath' ) || ! method_exists( 'ZipStream\\ZipStream', 'addFileFromStream' ) || ! method_exists( 'ZipStream\\ZipStream', 'finish' ) ) {
 				throw new RuntimeException( __( 'У завантаженій версії ZipStream немає потрібних методів.', 'site-backup-streamer' ) );
 			}
 
@@ -313,8 +329,21 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 				( new ReflectionMethod( 'ZipStream\\ZipStream', 'addFileFromPath' ) )->getParameters()
 			);
 
-			foreach ( array( 'fileName', 'path', 'lastModificationDateTime' ) as $parameter ) {
+			foreach ( array( 'fileName', 'path', 'lastModificationDateTime', 'maxSize' ) as $parameter ) {
 				if ( ! in_array( $parameter, $add_file_parameters, true ) ) {
+					throw new RuntimeException( __( 'Завантажена версія ZipStream несумісна з плагіном.', 'site-backup-streamer' ) );
+				}
+			}
+
+			$add_stream_parameters = array_map(
+				static function ( ReflectionParameter $parameter ): string {
+					return $parameter->getName();
+				},
+				( new ReflectionMethod( 'ZipStream\\ZipStream', 'addFileFromStream' ) )->getParameters()
+			);
+
+			foreach ( array( 'fileName', 'stream', 'maxSize' ) as $parameter ) {
+				if ( ! in_array( $parameter, $add_stream_parameters, true ) ) {
 					throw new RuntimeException( __( 'Завантажена версія ZipStream несумісна з плагіном.', 'site-backup-streamer' ) );
 				}
 			}
@@ -330,8 +359,17 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		private static function prepare_streaming_response(): void {
 			self::prepare_long_operation();
 
-			while ( ob_get_level() ) {
-				ob_end_clean();
+			// A buffer started without the removable flag cannot be ended: stop instead of looping forever.
+			while ( ob_get_level() > 0 ) {
+				$level = ob_get_level();
+				if ( ! @ob_end_clean() || ob_get_level() >= $level ) {
+					break;
+				}
+			}
+
+			// Through such a buffer the archive or the dump would pile up in memory, so refuse before any header.
+			if ( ob_get_level() > 0 ) {
+				throw new RuntimeException( __( 'Інший код запустив буфер виводу, який не можна зняти, тож потокове завантаження неможливе: архів або дамп накопичувався б у пам\'яті. Вимкніть плагін, що його запускає, і спробуйте знову.', 'site-backup-streamer' ) );
 			}
 		}
 
@@ -352,16 +390,91 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		}
 
 		/**
-		 * Returns memory left under memory_limit in bytes, or null when there is no limit.
+		 * Returns memory_limit in bytes, or null when there is no limit.
 		 */
-		private static function free_memory(): ?int {
+		private static function memory_limit(): ?int {
 			$limit = wp_convert_hr_to_bytes( (string) ini_get( 'memory_limit' ) );
 
-			return $limit > 0 ? $limit - memory_get_usage() : null;
+			return $limit > 0 ? $limit : null;
 		}
 
 		/**
-		 * Stops a files export that would run out of memory on the first file.
+		 * Returns memory left under memory_limit in bytes, or null when there is no limit.
+		 *
+		 * PHP checks the limit against the memory it took from the system, so this counts the real usage.
+		 */
+		private static function free_memory(): ?int {
+			$limit = self::memory_limit();
+
+			return null === $limit ? null : $limit - memory_get_usage( true );
+		}
+
+		/**
+		 * Returns the memory PHP takes for one allocation of the given size.
+		 *
+		 * A string adds its header; blocks above about 2 MB are mapped on their own, page-aligned, and 2 MB-aligned
+		 * on Windows.
+		 */
+		private static function heap_block( int $bytes ): int {
+			if ( $bytes <= 0 ) {
+				return 0;
+			}
+
+			$bytes += 32;
+			$align  = $bytes > 2093056 && 'Windows' === PHP_OS_FAMILY ? 2097152 : 4096;
+
+			return intdiv( $bytes + $align - 1, $align ) * $align;
+		}
+
+		/**
+		 * Returns the new central directory array ZipStream allocates when it adds a record to the given count.
+		 */
+		private static function cdr_growth( int $entries ): int {
+			// The array doubles when it holds a power of two records (it starts with 8 slots).
+			return $entries >= 8 && 0 === ( $entries & ( $entries - 1 ) ) ? self::heap_block( 2 * $entries * self::ZIP_CDR_SLOT ) : 0;
+		}
+
+		/**
+		 * Returns the free memory ZipStream needs to add a file of the given size to an archive of $entries files.
+		 */
+		private static function zip_memory_needed( int $size, int $entries = 0 ): int {
+			$size  = max( 0, $size );
+			$first = min( $size, self::ZIP_READ_BLOCK );
+			$next  = min( $size - $first, self::ZIP_READ_BLOCK );
+
+			return self::heap_block( $first ) + self::heap_block( $next ) + self::cdr_growth( $entries ) + self::ZIP_MEMORY_MARGIN;
+		}
+
+		/**
+		 * Checks whether a file of the given size can be added to an archive of $entries files right now.
+		 *
+		 * Running out of memory in the middle of a file is a fatal error that leaves a broken ZIP. The note reserve,
+		 * with the array growth the note itself may need, stays free for backup-incomplete.txt.
+		 */
+		private static function zip_file_fits( int $size, int $entries = 0 ): bool {
+			$free = self::free_memory();
+
+			return null === $free || $free >= self::zip_memory_needed( $size, $entries ) + self::cdr_growth( $entries + 1 ) + self::ZIP_NOTE_RESERVE;
+		}
+
+		/**
+		 * Returns about the largest file that fits into the given free memory, or null when any file does.
+		 */
+		private static function largest_zip_file( int $free ): ?int {
+			$room = $free - self::ZIP_MEMORY_MARGIN - self::ZIP_NOTE_RESERVE;
+
+			return $room >= 2 * self::heap_block( self::ZIP_READ_BLOCK ) ? null : max( 0, $room );
+		}
+
+		/**
+		 * Formats a size for plain text: size_format() puts &nbsp; between thousands in some locales.
+		 */
+		private static function plain_size( int $bytes, int $decimals = 0 ): string {
+			return html_entity_decode( (string) size_format( $bytes, $decimals ), ENT_QUOTES, 'UTF-8' );
+		}
+
+		/**
+		 * Stops a files export that has no memory even for small files.
 		 *
 		 * Otherwise PHP dies right after the first ZIP entry header and WordPress appends its
 		 * "critical error" page to the download.
@@ -369,7 +482,7 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		private static function assert_zip_memory(): void {
 			$free = self::free_memory();
 
-			if ( null !== $free && $free < self::ZIP_MEMORY_HEADROOM ) {
+			if ( null !== $free && $free < self::ZIP_MEMORY_MINIMUM ) {
 				throw new RuntimeException( self::zip_memory_message( $free ) );
 			}
 		}
@@ -379,11 +492,61 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		 */
 		private static function zip_memory_message( int $free ): string {
 			return sprintf(
-				/* translators: 1: free memory, 2: required memory. */
-				__( 'Замало пам\'яті для архіву: вільно %1$s, потрібно щонайменше %2$s. Збільште WP_MAX_MEMORY_LIMIT або memory_limit.', 'site-backup-streamer' ),
+				/* translators: 1: free memory, 2: memory_limit, 3: required memory. */
+				__( 'Замало пам\'яті для архіву: вільно %1$s з %2$s, потрібно щонайменше %3$s. Збільште WP_MAX_MEMORY_LIMIT або memory_limit.', 'site-backup-streamer' ),
 				size_format( max( 0, $free ) ),
-				size_format( self::ZIP_MEMORY_HEADROOM )
+				size_format( (int) self::memory_limit() ),
+				size_format( self::ZIP_MEMORY_MINIMUM )
 			);
+		}
+
+		/**
+		 * Builds the "Пам'ять" check row from the free memory the files export will get.
+		 *
+		 * Short of memory for the largest files the row is a warning only: those files are left out and listed in
+		 * the archive. It blocks the files download only when not even small files fit.
+		 *
+		 * @return array{label:string,message:string,status:string,critical:bool,scope:string}
+		 */
+		private static function memory_check_result( ?int $free, ?int $limit ): array {
+			if ( null === $free || null === $limit ) {
+				return self::check_result( 'Пам\'ять', true, 'Без обмеження', '', 'files' );
+			}
+
+			if ( $free < self::ZIP_MEMORY_MINIMUM ) {
+				return self::check_result( 'Пам\'ять', false, '', self::zip_memory_message( $free ), 'files' );
+			}
+
+			$summary = sprintf(
+				/* translators: 1: free memory, 2: memory_limit, 3: used memory. */
+				__( 'Вільно %1$s: ліміт %2$s, зайнято %3$s', 'site-backup-streamer' ),
+				size_format( $free ),
+				size_format( $limit ),
+				size_format( max( 0, $limit - $free ) )
+			);
+			$largest = self::largest_zip_file( $free );
+
+			if ( null === $largest ) {
+				return self::check_result( 'Пам\'ять', true, $summary, '', 'files' );
+			}
+
+			$row = self::check_result(
+				'Пам\'ять',
+				true,
+				sprintf(
+					/* translators: 1: free memory summary, 2: file size, 3: file name. */
+					__( '%1$s. Файли понад ~%2$s можуть не ввійти в архів, а на сайтах із десятками тисяч файлів — і менші; їх список буде в %3$s. Збільште WP_MAX_MEMORY_LIMIT або memory_limit.', 'site-backup-streamer' ),
+					$summary,
+					size_format( $largest ),
+					self::ZIP_INCOMPLETE_NOTE
+				),
+				'',
+				'files'
+			);
+
+			$row['status'] = 'warning';
+
+			return $row;
 		}
 
 		/**
@@ -417,14 +580,59 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 			$directories = self::backup_directories();
 			$zip         = self::create_zip( self::filename( 'site-files', 'zip' ) );
 
+			self::write_files_zip( $zip, $directories );
+			$zip->finish();
+		}
+
+		/**
+		 * Adds the site files to the archive, leaving out the ones that do not fit into the free memory.
+		 *
+		 * @param array<string,string> $directories Directories from backup_directories().
+		 * @return array{count:int,bytes:int,files:array<int,array{0:string,1:int}>} Files left out for lack of memory.
+		 */
+		private static function write_files_zip( ZipStream\ZipStream $zip, array $directories ): array {
+			$left_out = array(
+				'count' => 0,
+				'bytes' => 0,
+				'files' => array(),
+			);
+			$listed   = 0; // Bytes of listed names.
+			$entries  = 0; // Records ZipStream holds.
+
 			self::walk_backup_files(
 				$directories,
-				static function ( string $path, string $name, SplFileInfo $file ) use ( $zip ): bool {
-					return self::add_file_to_zip( $zip, $path, $name, $file );
+				static function ( string $path, string $name, SplFileInfo $file ) use ( $zip, &$left_out, &$listed, &$entries ): bool {
+					try {
+						$size = $file->getSize();
+					} catch ( RuntimeException $e ) {
+						return false;
+					}
+
+					if ( ! self::zip_file_fits( $size, $entries ) ) {
+						$left_out['count']++;
+						$left_out['bytes'] += $size;
+						if ( count( $left_out['files'] ) < self::ZIP_NOTE_MAX_FILES && $listed + strlen( $name ) <= self::ZIP_NOTE_MAX_BYTES ) {
+							$left_out['files'][] = array( $name, $size );
+							$listed             += strlen( $name );
+						}
+						return false;
+					}
+
+					if ( ! self::add_file_to_zip( $zip, $path, $name, $file ) ) {
+						return false;
+					}
+
+					$entries++;
+					return true;
 				}
 			);
 
-			$zip->finish();
+			if ( $left_out['count'] > 0 ) {
+				error_log( sprintf( 'Site Backup Streamer: %d files (%d bytes) left out of the archive for lack of memory.', $left_out['count'], $left_out['bytes'] ) );
+				self::add_incomplete_note( $zip, $left_out, $entries );
+			}
+
+			return $left_out;
 		}
 
 		/**
@@ -433,21 +641,82 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		private static function add_file_to_zip( ZipStream\ZipStream $zip, string $path, string $name, SplFileInfo $file ): bool {
 			try {
 				$modified = $file->getMTime();
+				$size     = $file->getSize();
 			} catch ( RuntimeException $e ) {
 				return false;
 			}
 
-			// ZIP dates start in 1980 and ZipStream throws on older ones (files unpacked with a zero timestamp).
-			$modified_at = $modified < self::ZIP_MIN_TIMESTAMP ? new DateTimeImmutable( '@' . self::ZIP_MIN_TIMESTAMP ) : null;
+			// ZIP (DOS) dates cover 1980-2107 and ZipStream throws outside that range, which would abort the whole
+			// archive: files unpacked with a zero timestamp or stamped far in the future get the nearest valid date.
+			// The date always goes in UTC: left to ZipStream it is taken in the default timezone, where the range
+			// check and the conversion disagree near the ends.
+			$modified_at = new DateTimeImmutable( '@' . min( max( $modified, self::ZIP_MIN_TIMESTAMP ), self::ZIP_MAX_TIMESTAMP ) );
 
 			try {
-				$zip->addFileFromPath( fileName: $name, path: $path, lastModificationDateTime: $modified_at );
+				// maxSize keeps fread() to the file size instead of a whole 16 MB block and holds the read to what
+				// zip_file_fits() checked; a file that grows meanwhile is archived as it was when listed.
+				$zip->addFileFromPath( fileName: $name, path: $path, lastModificationDateTime: $modified_at, maxSize: $size );
 			} catch ( ZipStream\Exception\FileNotFoundException | ZipStream\Exception\FileNotReadableException $e ) {
 				// Deleted or locked after the directory was listed; nothing was written for it yet.
 				return false;
 			}
 
 			return true;
+		}
+
+		/**
+		 * Adds backup-incomplete.txt with the files left out for lack of memory.
+		 *
+		 * @param array{count:int,bytes:int,files:array<int,array{0:string,1:int}>} $left_out Files left out.
+		 * @param int                                                               $entries  Files in the archive.
+		 */
+		private static function add_incomplete_note( ZipStream\ZipStream $zip, array $left_out, int $entries ): void {
+			$lines = array(
+				sprintf(
+					/* translators: 1: number of files, 2: their total size. */
+					__( 'Архів неповний: через нестачу пам\'яті PHP не ввійшло файлів: %1$d (%2$s).', 'site-backup-streamer' ),
+					$left_out['count'],
+					self::plain_size( $left_out['bytes'] )
+				),
+				sprintf(
+					/* translators: 1: memory_limit, 2: largest read, 3: fixed reserve. */
+					__( 'memory_limit: %1$s. Файлу потрібно стільки вільної пам\'яті, скільки він важить (але не більше %2$s), плюс запас близько %3$s, а кожен уже доданий файл займає ще кількасот байтів до кінця архіву — тож на сайтах із дуже великою кількістю файлів не вміщаються й малі.', 'site-backup-streamer' ),
+					self::plain_size( (int) self::memory_limit() ),
+					self::plain_size( 2 * self::ZIP_READ_BLOCK ),
+					self::plain_size( self::ZIP_MEMORY_MARGIN + self::ZIP_NOTE_RESERVE )
+				),
+				__( 'Заберіть ці файли окремо (FTP або файловий менеджер хостингу) або збільште WP_MAX_MEMORY_LIMIT чи memory_limit і завантажте архів знову.', 'site-backup-streamer' ),
+				'',
+			);
+
+			foreach ( $left_out['files'] as $file ) {
+				$lines[] = self::plain_size( $file[1], 1 ) . "\t" . $file[0];
+			}
+
+			$rest = $left_out['count'] - count( $left_out['files'] );
+			if ( $rest > 0 ) {
+				/* translators: %d: number of files. */
+				$lines[] = sprintf( __( '… і ще файлів: %d', 'site-backup-streamer' ), $rest );
+			}
+
+			$text = implode( "\n", $lines ) . "\n";
+			unset( $lines );
+
+			// On top of the string: its copy in php://memory, the read buffer, the array growth for one more record
+			// and a fresh 2 MB heap chunk. The note reserve kept this free while files were added.
+			$free = self::free_memory();
+			if ( null !== $free && $free < 2 * self::heap_block( strlen( $text ) ) + self::cdr_growth( $entries ) + 2097152 ) {
+				error_log( 'Site Backup Streamer: no memory left for ' . self::ZIP_INCOMPLETE_NOTE . '.' );
+				return;
+			}
+
+			// Our own stream rather than addFile(): with maxSize ZipStream 3.1.1 writes the text into php://memory twice,
+			// and exactSize is missing before 3.1. maxSize keeps the read buffer to the text length.
+			$stream = fopen( 'php://memory', 'w+b' );
+			fwrite( $stream, $text );
+			rewind( $stream );
+			$zip->addFileFromStream( fileName: self::ZIP_INCOMPLETE_NOTE, stream: $stream, maxSize: strlen( $text ) );
+			fclose( $stream );
 		}
 
 		/**
@@ -773,16 +1042,10 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 				'php://output недоступний'
 			);
 
-			// The download request raises the limit the same way, so this is what the export will get.
+			// The download request raises the limit the same way. It loads the same plugins but does not render the
+			// admin page, so the export usually gets a bit more than this.
 			wp_raise_memory_limit( 'admin' );
-			$free     = self::free_memory();
-			$checks[] = self::check_result(
-				'Пам\'ять',
-				null === $free || $free >= self::ZIP_MEMORY_HEADROOM,
-				null === $free ? 'Без обмеження' : 'Вільно ' . size_format( $free ),
-				null === $free ? '' : self::zip_memory_message( $free ),
-				'files'
-			);
+			$checks[] = self::memory_check_result( self::free_memory(), self::memory_limit() );
 
 			try {
 				self::load_dependencies();

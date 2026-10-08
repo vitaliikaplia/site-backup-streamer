@@ -3,7 +3,7 @@
 WordPress-плагін: віджет на Dashboard, який віддає резервну копію сайту прямо в браузер — файли
 сайту в ZIP і базу даних у SQL, без створення архіву на сервері. Доступно лише адміністраторам.
 
-Поточна версія: **1.1.1** · PHP 8.1+ · WordPress 6.0+ · [зміни](CHANGELOG.md)
+Поточна версія: **1.1.2** · PHP 8.1+ · WordPress 6.0+ · [зміни](CHANGELOG.md)
 
 Встановлення: завантажте `site-backup-streamer.zip` з
 [останнього релізу](https://github.com/vitaliikaplia/site-backup-streamer/releases/latest) і встановіть
