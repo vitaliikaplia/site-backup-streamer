@@ -11,13 +11,13 @@
     }
   ],
   "require": {
-    "php": ">=8.3",
+    "php": ">=8.1",
     "ifsnop/mysqldump-php": "^2.13",
-    "maennchen/zipstream-php": "^3.2"
+    "maennchen/zipstream-php": "^3.1.1"
   },
   "config": {
     "platform": {
-      "php": "8.3"
+      "php": "8.1"
     },
     "allow-plugins": {
       "composer/installers": true

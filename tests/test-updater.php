@@ -124,7 +124,7 @@ sbs_test('updater: parse_headers of the real site-backup-streamer.php matches th
     $headers = SBS_GitHub_Updater::parse_headers((string) file_get_contents(SBS_FILE));
     sbs_assert_same(SBS_VERSION, $headers['version']);
     sbs_assert_true($headers['tested'] !== '', 'Tested up to header present');
-    sbs_assert_same('8.3', $headers['requires_php']);
+    sbs_assert_same('8.1', $headers['requires_php']);
 });
 
 sbs_test('updater: the plugin declares Update URI', function () {

@@ -27,15 +27,11 @@ function sbs_walk(string $root): array {
     return [$stats, $names];
 }
 
-/** Opens a ZIP written by ZipStream into a temp file. */
+/** Writes a ZIP with the plugin's own ZipStream settings into a temp file. */
 function sbs_zip_to_file(callable $fill): string {
     sbs_call('load_dependencies');
     $file = tempnam(sys_get_temp_dir(), 'sbs-zip-');
-    $zip  = new ZipStream\ZipStream(
-        outputStream: fopen($file, 'wb'),
-        sendHttpHeaders: false,
-        defaultCompressionMethod: ZipStream\CompressionMethod::STORE
-    );
+    $zip  = sbs_call('zip_writer', fopen($file, 'wb'), 'test.zip');
     $fill($zip);
     $zip->finish();
     return $file;
@@ -135,6 +131,31 @@ sbs_test('backup: a file that disappears before it is added is skipped, the arch
         sbs_assert_same(1, $archive->numFiles);
         $archive->close();
         @unlink($file);
+    } finally {
+        sbs_rm_tree($root);
+    }
+});
+
+sbs_test('backup: a file that starts past 4 GB gets a valid zip64 local header', function () {
+    $root = sbs_temp_dir('zip64');
+    try {
+        file_put_contents($root . '/f.txt', 'hello');
+        $file = sbs_zip_to_file(function ($zip) use ($root) {
+            // Pretend 4 GB are already written: the entry's offset needs zip64, its sizes do not.
+            (new ReflectionProperty($zip, 'offset'))->setValue($zip, 0x100000000);
+            sbs_call('add_file_to_zip', $zip, $root . '/f.txt', 'site/f.txt', new SplFileInfo($root . '/f.txt'));
+        });
+        $data = (string) file_get_contents($file);
+        @unlink($file);
+        $header = unpack('Vsignature/vversion/vflags/x6/Vcrc/Vcompressed/Vuncompressed/vname/vextra', $data);
+        $zip64  = unpack('vid/vsize', substr($data, 30 + $header['name'], $header['extra']));
+        sbs_assert_same(0x04034b50, $header['signature'], 'local file header');
+        sbs_assert_true(($header['flags'] & 0x08) !== 0, 'sizes follow the data (zero header)');
+        sbs_assert_same(0x0001, $zip64['id'], 'zip64 extra field');
+        // Every 0xFFFFFFFF size needs its 8 bytes in the zip64 field. ZipStream 3.1.1 without the zero header
+        // wrote both sentinels with only the offset there (upstream PR #413), and unzippers read it as the size.
+        $sentinels = (int) ($header['compressed'] === 0xFFFFFFFF) + (int) ($header['uncompressed'] === 0xFFFFFFFF);
+        sbs_assert_true($zip64['size'] >= 8 * $sentinels, "zip64 field of {$zip64['size']} bytes for $sentinels size sentinels");
     } finally {
         sbs_rm_tree($root);
     }

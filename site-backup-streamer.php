@@ -2,9 +2,9 @@
 /**
  * Plugin Name: Site Backup Streamer
  * Description: Adds a dashboard widget for streaming WordPress site files and database backups.
- * Version: 1.1.0
+ * Version: 1.1.1
  * Requires at least: 6.0
- * Requires PHP: 8.3
+ * Requires PHP: 8.1
  * Tested up to: 7.0
  * Author: Vitalii Kaplia
  * Author URI: https://vitaliikaplia.com/
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
-	define( 'SBS_VERSION', '1.1.0' );
+	define( 'SBS_VERSION', '1.1.1' );
 	define( 'SBS_FILE', __FILE__ );
 	define( 'SBS_BASENAME', plugin_basename( __FILE__ ) );
 	// Branch of the dev update channel (SBS_UPDATE_CHANNEL = 'branch'); can be overridden in wp-config.php.
@@ -296,7 +296,7 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 				$zip_constructor->getParameters()
 			);
 
-			foreach ( array( 'outputName', 'outputStream', 'sendHttpHeaders', 'defaultCompressionMethod', 'enableZip64', 'flushOutput' ) as $parameter ) {
+			foreach ( array( 'outputName', 'outputStream', 'sendHttpHeaders', 'defaultCompressionMethod', 'defaultEnableZeroHeader', 'enableZip64', 'flushOutput' ) as $parameter ) {
 				if ( ! in_array( $parameter, $zip_parameters, true ) ) {
 					throw new RuntimeException( __( 'Завантажена версія ZipStream несумісна з плагіном.', 'site-backup-streamer' ) );
 				}
@@ -464,11 +464,23 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 		private static function create_zip( string $filename ): ZipStream\ZipStream {
 			self::send_download_headers( $filename, 'application/zip' );
 
+			return self::zip_writer( fopen( 'php://output', 'wb' ), $filename );
+		}
+
+		/**
+		 * Creates the ZipStream writer with the archive settings of the plugin.
+		 *
+		 * @param resource $output_stream Stream the archive is written to.
+		 */
+		private static function zip_writer( $output_stream, string $filename ): ZipStream\ZipStream {
 			return new ZipStream\ZipStream(
 				outputName: $filename,
-				outputStream: fopen( 'php://output', 'wb' ),
+				outputStream: $output_stream,
 				sendHttpHeaders: false,
 				defaultCompressionMethod: ZipStream\CompressionMethod::STORE,
+				// Sizes go after the data, so every file is read once. Without it ZipStream 3.1.1 also writes
+				// wrong local header sizes for files that start past 4 GB (fixed upstream only in 3.2.2).
+				defaultEnableZeroHeader: true,
 				enableZip64: true,
 				flushOutput: true
 			);
@@ -718,9 +730,9 @@ if ( ! class_exists( 'SBS_Site_Backup_Streamer', false ) ) {
 			$checks = array();
 			$checks[] = self::check_result(
 				'PHP',
-				PHP_VERSION_ID >= 80300,
+				PHP_VERSION_ID >= 80100,
 				PHP_VERSION . ' OK',
-				PHP_VERSION . ' потрібен PHP 8.3+'
+				PHP_VERSION . ' потрібен PHP 8.1+'
 			);
 			$checks[] = self::check_result(
 				'Composer vendor',

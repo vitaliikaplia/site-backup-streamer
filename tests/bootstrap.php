@@ -121,9 +121,7 @@ function sbs_assert_null($actual, string $message = ''): void {
 
 /** Calls a private static method of the plugin class. */
 function sbs_call(string $method, ...$args) {
-    $reflection = new ReflectionMethod('SBS_Site_Backup_Streamer', $method);
-    $reflection->setAccessible(true);
-    return $reflection->invoke(null, ...$args);
+    return (new ReflectionMethod('SBS_Site_Backup_Streamer', $method))->invoke(null, ...$args);
 }
 
 function sbs_temp_dir(string $prefix): string {

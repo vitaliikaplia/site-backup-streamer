@@ -2,7 +2,7 @@ name: Release
 
 # Push a tag vX.Y.Z (matching the plugin version everywhere) to publish a GitHub Release with
 # site-backup-streamer.zip + site-backup-streamer.zip.sha256. Sites on 1.1.0+ update only from these
-# release assets (1.0.0 has no updater and is updated to 1.1.0 once by hand).
+# release assets (1.0.0 has no updater and is updated once by hand to the latest release).
 #
 # Three jobs keep the package trustworthy: `package` builds the zip and the release notes with git and
 # the runner's preinstalled PHP only (no third-party actions) and checks the unpacked zip (every
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        php: ['8.3', '8.5']
+        php: ['8.1', '8.5']
     steps:
       - uses: actions/checkout@v5
 
